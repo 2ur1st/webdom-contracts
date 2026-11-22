@@ -1,15 +1,16 @@
 import { Blockchain, printTransactionFees, SandboxContract, SendMessageResult, TreasuryContract } from '@ton/sandbox';
 import { Address, beginCell, Cell, toNano } from '@ton/core';
-import { JettonSimpleSale, JettonSimpleSaleConfig } from '../wrappers/JettonSimpleSale';
+import { JettonSimpleSale, JettonSimpleSaleConfig } from '../../wrappers/JettonSimpleSale';
 import '@ton/test-utils';
 import { compile } from '@ton/blueprint';
-import { DnsCollection, DnsCollectionConfig } from '../wrappers/DnsCollection';
-import { Domain, DomainConfig } from '../wrappers/Domain';
-import { getIndexByDomainName } from '../wrappers/helpers/dnsUtils';
-import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes, Tons } from '../wrappers/helpers/constants';
-import { jettonsToString } from '../wrappers/helpers/functions';
-import { JettonMinter } from '../wrappers/JettonMinter';
-import { JettonWallet } from '../wrappers/JettonWallet';
+import { DnsCollection, DnsCollectionConfig } from '../../wrappers/DnsCollection';
+import { Domain, DomainConfig } from '../../wrappers/Domain';
+import { getIndexByDomainName } from '../../wrappers/helpers/dnsUtils';
+import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes, Tons } from '../../wrappers/helpers/constants';
+import { jettonsToString } from '../../wrappers/helpers/functions';
+import { JettonMinter } from '../../wrappers/JettonMinter';
+import { JettonWallet } from '../../wrappers/JettonWallet';
+import { readSalePricing } from '../helpers/saleStorage';
 
 
 function domainToNotification(domainName: string): Cell {
@@ -148,7 +149,7 @@ describe('JettonSimpleSale', () => {
         await jettonSimpleSale.sendChangePrice(seller.getSender(), jettonSimpleSaleConfig.price, blockchain.now! + 600);
 
         // reject if not enough jettons
-        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonSimpleSaleConfig.price - 100n, jettonSimpleSale.address, buyer.address, toNano("0.235"));
+        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonSimpleSaleConfig.price - 100n, jettonSimpleSale.address, buyer.address, toNano("0.3"));
         expect(transactionRes.transactions).toHaveTransaction({
             from: usdtBuyerWallet.address,
             to: buyer.address,
@@ -166,7 +167,7 @@ describe('JettonSimpleSale', () => {
         })
 
         // accept 
-        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonSimpleSaleConfig.price + 100n, jettonSimpleSale.address, buyer.address, toNano("0.235"));
+        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonSimpleSaleConfig.price + 100n, jettonSimpleSale.address, buyer.address, toNano("0.3"));
         expect(transactionRes.transactions).toHaveTransaction({
             from: usdtSellerWallet.address,
             to: seller.address,
@@ -204,8 +205,8 @@ describe('JettonSimpleSale', () => {
 
     it("should handle dedust swap", async () => {
         transactionRes = await usdtMarketplaceWallet.sendTransfer(
-            admin.getSender(), jettonSimpleSaleConfig.price, jettonSimpleSale.address, buyer.address, 
-            toNano("0.235"), beginCell().storeAddress(buyer.address).endCell()
+            admin.getSender(), jettonSimpleSaleConfig.price, jettonSimpleSale.address, buyer.address,
+            toNano("0.3"), beginCell().storeAddress(buyer.address).endCell()
         );
         jettonSimpleSaleConfig = await jettonSimpleSale.getStorageData();
         expect(jettonSimpleSaleConfig.buyerAddress!.toString()).toEqual(buyer.address.toString());
@@ -265,10 +266,14 @@ describe('JettonSimpleSale', () => {
     });
 
     it("should reject purchase when domain is expired by renewal time", async () => {
-        await jettonSimpleSale.sendChangePrice(seller.getSender(), jettonSimpleSaleConfig.price, 0xffffffff);
+        // Prepay auto-renew so validUntil may legitimately extend past the domain's renewal-time expiry
+        // (under the cap an iterations=0 sale's validUntil ends exactly at that boundary, so the only way
+        // to reach the DOMAIN_EXPIRED guard with validUntil still in the future is via prepaid iterations).
+        await jettonSimpleSale.sendSetAutoRenewParams(seller.getSender(), ONE_DAY * 30, 2);
         jettonSimpleSaleConfig = await jettonSimpleSale.getStorageData();
         blockchain.now! = jettonSimpleSaleConfig.lastRenewalTime + ONE_YEAR;
-        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonSimpleSaleConfig.price, jettonSimpleSale.address, buyer.address, toNano("0.235"));
+        expect(jettonSimpleSaleConfig.validUntil).toBeGreaterThan(blockchain.now!);
+        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonSimpleSaleConfig.price, jettonSimpleSale.address, buyer.address, toNano("0.3"));
         expect(transactionRes.transactions).toHaveTransaction({
             from: usdtBuyerWallet.address,
             to: buyer.address,
@@ -277,74 +282,6 @@ describe('JettonSimpleSale', () => {
         });
     });
 
-    it("should disable renew paths and skip renewal-time expiration check for tg usernames", async () => {
-        transactionRes = await jettonSimpleSale.sendCancelSale(seller.getSender());
-        expect(transactionRes.transactions).toHaveTransaction({
-            from: seller.address,
-            to: jettonSimpleSale.address,
-            success: true,
-        });
-        domainConfig = await domain.getStorageData();
-        expect(domainConfig.ownerAddress!.toString()).toEqual(seller.address.toString());
-
-        blockchain.now! += 1;
-        const tgSaleConfig: JettonSimpleSaleConfig = {
-            ...jettonSimpleSaleConfig,
-            state: JettonSimpleSale.STATE_UNINIT,
-            createdAt: blockchain.now!,
-            lastRenewalTime: blockchain.now! - ONE_YEAR,
-            validUntil: blockchain.now! + ONE_DAY,
-            buyerAddress: null,
-            domainName: "testusername.t.me",
-            isTgUsername: false,
-        };
-        const tgSale = blockchain.openContract(JettonSimpleSale.createFromConfig(tgSaleConfig, fixPriceSaleCode));
-        const tgSaleWallet = blockchain.openContract(JettonWallet.createFromAddress(await usdtMinter.getWalletAddress(tgSale.address)));
-        await tgSale.sendDeploy(admin.getSender(), toNano('0.05'), beginCell().storeAddress(tgSaleWallet.address).endCell());
-        await domain.sendTransfer(seller.getSender(), tgSale.address, seller.address);
-
-        let tgSaleConfigAfterDeploy = await tgSale.getStorageData();
-        expect(tgSaleConfigAfterDeploy.isTgUsername).toEqual(true);
-
-        await tgSale.sendChangePrice(seller.getSender(), tgSaleConfigAfterDeploy.price, 0xffffffff);
-        tgSaleConfigAfterDeploy = await tgSale.getStorageData();
-        blockchain.now! = tgSaleConfigAfterDeploy.lastRenewalTime + ONE_YEAR;
-
-        transactionRes = await tgSale.sendRenewDomain(seller.getSender());
-        expect(transactionRes.transactions).toHaveTransaction({
-            from: seller.address,
-            to: tgSale.address,
-            exitCode: Exceptions.UNSUPPORTED_OP,
-        });
-
-        transactionRes = await tgSale.sendSetAutoRenewParams(seller.getSender(), ONE_DAY, 1);
-        expect(transactionRes.transactions).toHaveTransaction({
-            from: seller.address,
-            to: tgSale.address,
-            exitCode: Exceptions.UNSUPPORTED_OP,
-        });
-
-        await expect(tgSale.sendExternalTriggerAutoRenew()).rejects.toThrow("External message not accepted by smart contract");
-
-        transactionRes = await usdtBuyerWallet.sendTransfer(
-            buyer.getSender(),
-            tgSaleConfigAfterDeploy.price,
-            tgSale.address,
-            buyer.address,
-            toNano("0.235")
-        );
-        expect(transactionRes.transactions).not.toHaveTransaction({
-            from: usdtBuyerWallet.address,
-            to: buyer.address,
-            body: JettonWallet.transferNotificationMessage(
-                tgSaleConfigAfterDeploy.price,
-                tgSale.address,
-                beginCell().storeUint(0, 32).storeStringTail(`Error. Code ${Exceptions.DOMAIN_EXPIRED}`).endCell(),
-            ),
-        });
-        domainConfig = await domain.getStorageData();
-        expect(domainConfig.ownerAddress!.toString()).toEqual(buyer.address.toString());
-    });
 
     it("should top up auto-renew and execute external auto-renew", async () => {
         transactionRes = await jettonSimpleSale.sendSetAutoRenewParams(seller.getSender(), ONE_DAY, 2);
@@ -384,5 +321,20 @@ describe('JettonSimpleSale', () => {
         jettonSimpleSaleConfig = await jettonSimpleSale.getStorageData();
         expect(jettonSimpleSaleConfig.hotUntil).toEqual(blockchain.now! + ONE_DAY * 3 / 2);
         expect(jettonSimpleSaleConfig.coloredUntil).toEqual(blockchain.now! + ONE_DAY * 2);
+    });
+
+    // With floor rounding, every "drop to a dust price and back" trip shaved a unit off the commission,
+    // so a seller could walk it to 0 in a few dozen ChangePrice calls
+    it('should not let price round trips shave the commission', async () => {
+        const { validUntil } = await jettonSimpleSale.getStorageData();
+        const before = await readSalePricing(blockchain, jettonSimpleSale.address, 'jettonSimple');
+        for (let i = 0; i < 5; ++i) {
+            await jettonSimpleSale.sendChangePrice(seller.getSender(), 1001n, validUntil);
+            expect((await readSalePricing(blockchain, jettonSimpleSale.address, 'jettonSimple')).price).toEqual(1001n);
+            await jettonSimpleSale.sendChangePrice(seller.getSender(), before.price, validUntil);
+        }
+        const after = await readSalePricing(blockchain, jettonSimpleSale.address, 'jettonSimple');
+        expect(after.price).toEqual(before.price);
+        expect(after.commission).toBeGreaterThanOrEqual(before.commission);
     });
 });

@@ -101,12 +101,19 @@ export type MarketplaceConfig = {
     deployInfos: Dictionary<number, DeployInfoValue>;
     
     web3WalletAddress: Address;
+    // Undefined only when reading the storage of a marketplace before the USDT wallet field was added.
+    usdtWalletAddress?: Address;
+    contractCodes?: Cell;
     promotionPrices: Dictionary<number, PromotionPricesValue>;
     userSubscriptions?: Dictionary<Address, UserSubscriptionValue>;
     subscriptionsInfo?: Dictionary<number, Dictionary<number, bigint>>;
+    dnsRecordsDict?: Dictionary<bigint, Cell>;
 };
 
 export function marketplaceConfigToCell(config: MarketplaceConfig, isTest: boolean): Cell {
+    if (!config.usdtWalletAddress) {
+        throw new Error('usdtWalletAddress is required for the current storage layout');
+    }
     const codeType = isTest ? "TESTS" : "PROD";
     return beginCell()
         .storeAddress(config.ownerAddress)
@@ -119,7 +126,7 @@ export function marketplaceConfigToCell(config: MarketplaceConfig, isTest: boole
         
         .storeDict(config.deployInfos, Dictionary.Keys.Uint(32), deployInfoValueParser())
         .storeRef(
-            beginCell()
+            config.contractCodes ?? beginCell()
                 .storeRef(CONTRACT_CODES.DOMAIN[codeType])
                 .storeRef(CONTRACT_CODES.TG_USERNAME[codeType])
                 .storeRef(CONTRACT_CODES.WEB3_WALLET[codeType])
@@ -129,12 +136,63 @@ export function marketplaceConfigToCell(config: MarketplaceConfig, isTest: boole
         .storeRef(
             beginCell()
                 .storeAddress(config.web3WalletAddress)
+                .storeAddress(config.usdtWalletAddress)
                 .storeDict(config.promotionPrices, Dictionary.Keys.Uint(32), promotionPricesValueParser())
                 .storeDict(config.userSubscriptions, Dictionary.Keys.Address(), userSubscriptionValueParser())
                 .storeDict(config.subscriptionsInfo, Dictionary.Keys.Uint(8), subscriptionInfoValueParser())
+                .storeDict(config.dnsRecordsDict, Dictionary.Keys.BigUint(256), Dictionary.Values.Cell())
             .endCell()
         )
     .endCell();
+}
+
+/** Reads both the deployed legacy layout and the current layout, without a new getter. */
+export function marketplaceConfigFromCell(data: Cell): MarketplaceConfig {
+    const s = data.beginParse();
+    const config = {
+        ownerAddress: s.loadAddress(),
+        publicKey: s.loadUintBig(256),
+        moveUpSalePrice: s.loadCoins(),
+        currentTopSale: s.loadAddress(),
+        collectedFeesTon: s.loadUintBig(64),
+        collectedFeesDict: s.loadDict(Dictionary.Keys.Address(), Dictionary.Values.BigVarUint(4)),
+        deployInfos: s.loadDict(Dictionary.Keys.Uint(32), deployInfoValueParser()),
+        contractCodes: s.loadRef(),
+    };
+    const ds2 = s.loadRef().beginParse();
+    s.endParse();
+    const web3WalletAddress = ds2.loadAddress();
+    // Legacy ds2 has only dictionary presence bits after WEB3; an std address needs 267 bits.
+    const usdtWalletAddress = ds2.remainingBits >= 267 ? ds2.loadAddress() : undefined;
+    const promotionPrices = ds2.loadDict(Dictionary.Keys.Uint(32), promotionPricesValueParser());
+    const userSubscriptions = ds2.loadDict(Dictionary.Keys.Address(), userSubscriptionValueParser());
+    const subscriptionsInfo = ds2.loadDict(Dictionary.Keys.Uint(8), subscriptionInfoValueParser());
+    const dnsRecordsDict = ds2.remainingBits > 0
+        ? ds2.loadDict(Dictionary.Keys.BigUint(256), Dictionary.Values.Cell())
+        : undefined;
+    ds2.endParse();
+    return { ...config, web3WalletAddress, usdtWalletAddress, promotionPrices,
+        userSubscriptions, subscriptionsInfo, dnsRecordsDict };
+}
+
+/** Inserts the USDT address while preserving the root and every existing dictionary/code cell. */
+export function marketplaceDataWithUsdtWallet(data: Cell, usdtWalletAddress: Address): Cell {
+    const config = marketplaceConfigFromCell(data);
+    if (config.usdtWalletAddress) {
+        if (!config.usdtWalletAddress.equals(usdtWalletAddress)) {
+            throw new Error('Marketplace already has a different USDT wallet address');
+        }
+        return data;
+    }
+    const ds2 = data.refs[data.refs.length - 1].beginParse();
+    const upgradedDs2 = beginCell()
+        .storeAddress(ds2.loadAddress())
+        .storeAddress(usdtWalletAddress)
+        .storeSlice(ds2);
+    if (config.dnsRecordsDict === undefined) upgradedDs2.storeBit(0);
+    const root = beginCell().storeBits(data.bits);
+    for (const ref of data.refs.slice(0, -1)) root.storeRef(ref);
+    return root.storeRef(upgradedDs2.endCell()).endCell();
 }
 
 export class Marketplace extends DefaultContract {
@@ -251,6 +309,12 @@ export class Marketplace extends DefaultContract {
     static changePromotionPriceMessage(newPrice: Dictionary<number, PromotionPricesValue>, queryId: number = 0) {
         return beginCell().storeUint(OpCodes.CHANGE_PROMOTION_PRICE, 32).storeUint(queryId, 64).storeDict(newPrice, Dictionary.Keys.Uint(32), promotionPricesValueParser()).endCell();
     }
+    static changeSubscriptionsInfoMessage(newInfo: Dictionary<number, Dictionary<number, bigint>>, queryId: number = 0) {
+        return beginCell().storeUint(OpCodes.CHANGE_SUBSCRIPTIONS_INFO, 32).storeUint(queryId, 64).storeDict(newInfo, Dictionary.Keys.Uint(8), subscriptionInfoValueParser()).endCell();
+    }
+    static changeDnsRecordsMessage(dnsRecordsDict: Maybe<Dictionary<bigint, Cell>>, queryId: number = 0) {
+        return beginCell().storeUint(OpCodes.CHANGE_DNS_RECORDS, 32).storeUint(queryId, 64).storeDict(dnsRecordsDict, Dictionary.Keys.BigUint(256), Dictionary.Values.Cell()).endCell();
+    }
 
     async sendBuySubscription(provider: ContractProvider, via: Sender, subscriptionLevel: number, subscriptionPeriod: number, subscriptionPrice: bigint, queryId: number = 0) {
         await provider.internal(via, {
@@ -279,7 +343,7 @@ export class Marketplace extends DefaultContract {
 
     async sendUpdateDeployInfo(provider: ContractProvider, via: Sender, updatesDict: Dictionary<number, DeployInfoValue>, queryId: number = 0) {
         await provider.internal(via, {
-            value: toNano('0.01'),
+            value: toNano('0.03'),
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: Marketplace.updateDeployInfoMessage(updatesDict, queryId),
             bounce: true,
@@ -312,27 +376,28 @@ export class Marketplace extends DefaultContract {
             bounce: true,
         });
     }
-    
+
+    async sendChangeSubscriptionsInfo(provider: ContractProvider, via: Sender, newInfo: Dictionary<number, Dictionary<number, bigint>>, queryId: number = 0) {
+        await provider.internal(via, {
+            value: toNano('0.01'),
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: Marketplace.changeSubscriptionsInfoMessage(newInfo, queryId),
+            bounce: true,
+        });
+    }
+
+    async sendChangeDnsRecords(provider: ContractProvider, via: Sender, dnsRecordsDict: Maybe<Dictionary<bigint, Cell>>, queryId: number = 0) {
+        await provider.internal(via, {
+            value: toNano('0.01'),
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: Marketplace.changeDnsRecordsMessage(dnsRecordsDict, queryId),
+            bounce: true,
+        });
+    }
+
     async getStorageData(provider: ContractProvider): Promise<MarketplaceConfig> {
-        const { stack } = await provider.get('get_storage_data', []);
-
-        return {
-            ownerAddress: stack.readAddress(),
-            publicKey: stack.readBigNumber(),
-            deployInfos: stack.readCell().beginParse().loadDictDirect(Dictionary.Keys.Uint(32), deployInfoValueParser()),
-            
-            userSubscriptions: beginCell().storeMaybeRef(stack.readCellOpt()).asSlice().loadDict(Dictionary.Keys.Address(), userSubscriptionValueParser()),
-            subscriptionsInfo: beginCell().storeMaybeRef(stack.readCellOpt()).asSlice().loadDict(Dictionary.Keys.Uint(8), subscriptionInfoValueParser()),
-            
-            moveUpSalePrice: stack.readBigNumber(),
-            currentTopSale: stack.readAddress(),
-
-            web3WalletAddress: stack.readAddress(),
-
-            collectedFeesTon: stack.readBigNumber(),
-            collectedFeesDict: stack.readCellOpt()?.beginParse().loadDictDirect(Dictionary.Keys.Address(), Dictionary.Values.BigVarUint(4)),
-
-            promotionPrices: stack.readCell().beginParse().loadDictDirect(Dictionary.Keys.Uint(32), promotionPricesValueParser()),
-        };
+        const { state } = await provider.getState();
+        if (state.type !== 'active' || !state.data) throw new Error('Marketplace is not active');
+        return marketplaceConfigFromCell(Cell.fromBoc(state.data)[0]);
     }
 }

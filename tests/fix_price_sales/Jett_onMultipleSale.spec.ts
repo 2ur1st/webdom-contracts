@@ -1,14 +1,15 @@
 import { Blockchain, printTransactionFees, SandboxContract, SendMessageResult, TreasuryContract } from '@ton/sandbox';
 import { Address, beginCell, Cell, Dictionary, toNano } from '@ton/core';
-import { JettonMultipleSale, JettonMultipleSaleConfig } from '../wrappers/JettonMultipleSale';
+import { JettonMultipleSale, JettonMultipleSaleConfig } from '../../wrappers/JettonMultipleSale';
 import '@ton/test-utils';
 import { compile } from '@ton/blueprint';
-import { DnsCollection, DnsCollectionConfig } from '../wrappers/DnsCollection';
-import { Domain, DomainConfig } from '../wrappers/Domain';
-import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes } from '../wrappers/helpers/constants';
-import { jettonsToString } from '../wrappers/helpers/functions';
-import { JettonMinter } from '../wrappers/JettonMinter';
-import { JettonWallet } from '../wrappers/JettonWallet';
+import { DnsCollection, DnsCollectionConfig } from '../../wrappers/DnsCollection';
+import { Domain, DomainConfig } from '../../wrappers/Domain';
+import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes } from '../../wrappers/helpers/constants';
+import { jettonsToString } from '../../wrappers/helpers/functions';
+import { JettonMinter } from '../../wrappers/JettonMinter';
+import { JettonWallet } from '../../wrappers/JettonWallet';
+import { readSalePricing } from '../helpers/saleStorage';
 
 
 describe('MultipleJettonSale', () => {
@@ -136,6 +137,20 @@ describe('MultipleJettonSale', () => {
 
         for (let domain of domains) {
             transactionRes = await domain.sendTransfer(seller.getSender(), jettonMultipleSale.address, null, null, toNano('0.1'));
+            if (domain === domains[0]) {
+                const receipt = transactionRes.transactions.find(tx =>
+                    tx.inMessage?.info.type === 'internal'
+                    && tx.inMessage.info.src.equals(domain.address)
+                    && tx.inMessage.info.dest.equals(jettonMultipleSale.address))!.inMessage!;
+                const duplicate = await blockchain.sendMessage(receipt);
+                expect(duplicate.transactions).not.toHaveTransaction({
+                    from: jettonMultipleSale.address, to: domain.address, op: OpCodes.TRANSFER_NFT,
+                });
+                const partial = await jettonMultipleSale.getStorageData();
+                expect(partial.domainsReceived).toBe(1);
+                expect(partial.domainsReceived).toBeLessThan(partial.domainsTotal);
+                expect((await domain.getStorageData()).ownerAddress).toEqualAddress(jettonMultipleSale.address);
+            }
             domainConfigs.push(await domain.getStorageData());
         }
 
@@ -167,9 +182,11 @@ describe('MultipleJettonSale', () => {
             exitCode: Exceptions.DEAL_NOT_ACTIVE
         })
 
-        // accept 
+        // accept
         transactionRes = await jettonMultipleSale.sendChangePrice(seller.getSender(), jettonMultipleSaleConfig.price, blockchain.now! + 600);
-        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonMultipleSaleConfig.price, jettonMultipleSale.address, buyer.address, toNano("0.555"));
+        // F1: TONS_PURCHASE_PER_DOMAIN now embeds domainRefillFee, so the 4-domain jetton minimum rose
+        // from ~0.333 to ~0.592 TON; bump the forwarded TON above it (was 0.555).
+        transactionRes = await usdtBuyerWallet.sendTransfer(buyer.getSender(), jettonMultipleSaleConfig.price, jettonMultipleSale.address, buyer.address, toNano("0.65"));
 
         expect(transactionRes.transactions).toHaveTransaction({
             from: usdtSellerWallet.address,
@@ -293,5 +310,20 @@ describe('MultipleJettonSale', () => {
             let domainConfig = await domain.getStorageData();
             expect(domainConfig.lastRenewalTime).toEqual(blockchain.now!);
         }
+    });
+
+    // With floor rounding, every "drop to a dust price and back" trip shaved a unit off the commission,
+    // so a seller could walk it to 0 in a few dozen ChangePrice calls
+    it('should not let price round trips shave the commission', async () => {
+        const { validUntil } = await jettonMultipleSale.getStorageData();
+        const before = await readSalePricing(blockchain, jettonMultipleSale.address, 'multiple');
+        for (let i = 0; i < 5; ++i) {
+            await jettonMultipleSale.sendChangePrice(seller.getSender(), 1001n, validUntil);
+            expect((await readSalePricing(blockchain, jettonMultipleSale.address, 'multiple')).price).toEqual(1001n);
+            await jettonMultipleSale.sendChangePrice(seller.getSender(), before.price, validUntil);
+        }
+        const after = await readSalePricing(blockchain, jettonMultipleSale.address, 'multiple');
+        expect(after.price).toEqual(before.price);
+        expect(after.commission).toBeGreaterThanOrEqual(before.commission);
     });
 });

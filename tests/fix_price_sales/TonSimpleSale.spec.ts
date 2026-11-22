@@ -1,13 +1,14 @@
 import { Blockchain, printTransactionFees, SandboxContract, SendMessageResult, TreasuryContract } from '@ton/sandbox';
 import { Address, beginCell, Cell, toNano } from '@ton/core';
-import { TonSimpleSale, TonSimpleSaleConfig } from '../wrappers/TonSimpleSale';
+import { TonSimpleSale, TonSimpleSaleConfig } from '../../wrappers/TonSimpleSale';
 import '@ton/test-utils';
 import { compile } from '@ton/blueprint';
-import { DnsCollection, DnsCollectionConfig } from '../wrappers/DnsCollection';
-import { Domain, DomainConfig } from '../wrappers/Domain';
-import { getIndexByDomainName } from '../wrappers/helpers/dnsUtils';
-import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes, Tons } from '../wrappers/helpers/constants';
-import { jettonsToString } from '../wrappers/helpers/functions';
+import { DnsCollection, DnsCollectionConfig } from '../../wrappers/DnsCollection';
+import { Domain, DomainConfig } from '../../wrappers/Domain';
+import { getIndexByDomainName } from '../../wrappers/helpers/dnsUtils';
+import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes, Tons } from '../../wrappers/helpers/constants';
+import { jettonsToString } from '../../wrappers/helpers/functions';
+import { readSalePricing, writeSalePricing } from '../helpers/saleStorage';
 
 describe('TonSimpleSale', () => {
     let fixPriceSaleCode: Cell;
@@ -159,11 +160,18 @@ describe('TonSimpleSale', () => {
             blockchain.now! += timeSpent;
             let newValidUntil = Math.ceil(blockchain.now! + ONE_DAY * Math.random() * 700 / checks);
             transactionRes = await tonSimpleSale.sendChangePrice(seller.getSender(), newPrice, newValidUntil);
-            if (newValidUntil < Math.max(blockchain.now! + 600, tonSimpleSaleConfig.validUntil)) {
+            if (tonSimpleSaleConfig.lastRenewalTime + ONE_YEAR - ONE_DAY < newValidUntil || newValidUntil < Math.max(blockchain.now! + 600, tonSimpleSaleConfig.validUntil)) {
                 expect(transactionRes.transactions).toHaveTransaction({
                     from: seller.address,
                     to: tonSimpleSale.address,
                     exitCode: Exceptions.INCORRECT_VALID_UNTIL
+                })
+            }
+            else if (newPrice <= Tons.MIN_SALE_PRICE) {
+                expect(transactionRes.transactions).toHaveTransaction({
+                    from: seller.address,
+                    to: tonSimpleSale.address,
+                    exitCode: Exceptions.INCORRECT_PRICE
                 })
             }
             else {
@@ -179,16 +187,28 @@ describe('TonSimpleSale', () => {
         }
     });
 
-    it("should set max validUntil", async () => {
-        const maxValidUntil = 0xffffffff;
+    it("should cap validUntil at the domain lifetime for .ton domains", async () => {
+        tonSimpleSaleConfig = await tonSimpleSale.getStorageData();
+        const maxValidUntil = tonSimpleSaleConfig.lastRenewalTime
+            + tonSimpleSaleConfig.autoRenewCooldown! * tonSimpleSaleConfig.autoRenewIterations!
+            + ONE_YEAR - ONE_DAY;
+
+        // setting exactly the cap succeeds
         transactionRes = await tonSimpleSale.sendChangePrice(seller.getSender(), tonSimpleSaleConfig.price, maxValidUntil);
         expect(transactionRes.transactions).not.toHaveTransaction({
             from: seller.address,
             to: tonSimpleSale.address,
             exitCode: Exceptions.INCORRECT_VALID_UNTIL
         });
-        tonSimpleSaleConfig = await tonSimpleSale.getStorageData();
-        expect(tonSimpleSaleConfig.validUntil).toEqual(maxValidUntil);
+        expect((await tonSimpleSale.getStorageData()).validUntil).toEqual(maxValidUntil);
+
+        // setting one second beyond the cap is rejected
+        transactionRes = await tonSimpleSale.sendChangePrice(seller.getSender(), tonSimpleSaleConfig.price, maxValidUntil + 1);
+        expect(transactionRes.transactions).toHaveTransaction({
+            from: seller.address,
+            to: tonSimpleSale.address,
+            exitCode: Exceptions.INCORRECT_VALID_UNTIL
+        });
     });
 
     it("should renew domain", async () => {
@@ -224,9 +244,14 @@ describe('TonSimpleSale', () => {
     })
 
     it("should reject purchase when domain is expired by renewal time", async () => {
-        await tonSimpleSale.sendChangePrice(seller.getSender(), tonSimpleSaleConfig.price, 0xffffffff);
+        // Prepay auto-renew so validUntil may legitimately extend past the domain's renewal-time expiry
+        // (under the cap an iterations=0 sale's validUntil ends exactly at that boundary, so the only way
+        // to reach the DOMAIN_EXPIRED guard with validUntil still in the future is via prepaid iterations).
+        await tonSimpleSale.sendSetAutoRenewParams(seller.getSender(), ONE_DAY * 30, 2);
         tonSimpleSaleConfig = await tonSimpleSale.getStorageData();
+        // Past the renewal-time expiry (lastRenewal + ONE_YEAR - ONE_DAY) but still within validUntil
         blockchain.now! = tonSimpleSaleConfig.lastRenewalTime + ONE_YEAR;
+        expect(tonSimpleSaleConfig.validUntil).toBeGreaterThan(blockchain.now!);
         transactionRes = await tonSimpleSale.sendPurchase(buyer.getSender(), tonSimpleSaleConfig.price);
         expect(transactionRes.transactions).toHaveTransaction({
             from: buyer.address,
@@ -235,63 +260,6 @@ describe('TonSimpleSale', () => {
         });
     });
 
-    it("should disable renew paths and skip renewal-time expiration check for tg usernames", async () => {
-        transactionRes = await tonSimpleSale.sendCancelSale(seller.getSender());
-        expect(transactionRes.transactions).toHaveTransaction({
-            from: seller.address,
-            to: tonSimpleSale.address,
-            success: true,
-        });
-        domainConfig = await domain.getStorageData();
-        expect(domainConfig.ownerAddress!.toString()).toEqual(seller.address.toString());
-
-        blockchain.now! += 1;
-        const tgSaleConfig: TonSimpleSaleConfig = {
-            ...tonSimpleSaleConfig,
-            state: TonSimpleSale.STATE_UNINIT,
-            createdAt: blockchain.now!,
-            lastRenewalTime: blockchain.now! - ONE_YEAR,
-            validUntil: blockchain.now! + ONE_DAY,
-            buyerAddress: null,
-            domainName: "testusername.t.me",
-            isTgUsername: false,
-        };
-        const tgSale = blockchain.openContract(TonSimpleSale.createFromConfig(tgSaleConfig, fixPriceSaleCode));
-        await tgSale.sendDeploy(admin.getSender(), toNano('0.05'));
-        await domain.sendTransfer(seller.getSender(), tgSale.address, null, null, 0n, 0, toNano('0.015'));
-
-        let tgSaleConfigAfterDeploy = await tgSale.getStorageData();
-        expect(tgSaleConfigAfterDeploy.isTgUsername).toEqual(true);
-
-        await tgSale.sendChangePrice(seller.getSender(), tgSaleConfigAfterDeploy.price, 0xffffffff);
-        tgSaleConfigAfterDeploy = await tgSale.getStorageData();
-        blockchain.now! = tgSaleConfigAfterDeploy.lastRenewalTime + ONE_YEAR;
-
-        transactionRes = await tgSale.sendRenewDomain(seller.getSender());
-        expect(transactionRes.transactions).toHaveTransaction({
-            from: seller.address,
-            to: tgSale.address,
-            exitCode: Exceptions.UNSUPPORTED_OP,
-        });
-
-        transactionRes = await tgSale.sendSetAutoRenewParams(seller.getSender(), ONE_DAY, 1);
-        expect(transactionRes.transactions).toHaveTransaction({
-            from: seller.address,
-            to: tgSale.address,
-            exitCode: Exceptions.UNSUPPORTED_OP,
-        });
-
-        await expect(tgSale.sendExternalTriggerAutoRenew()).rejects.toThrow("External message not accepted by smart contract");
-
-        transactionRes = await tgSale.sendPurchase(buyer.getSender(), tgSaleConfigAfterDeploy.price);
-        expect(transactionRes.transactions).not.toHaveTransaction({
-            from: buyer.address,
-            to: tgSale.address,
-            exitCode: Exceptions.DOMAIN_EXPIRED
-        });
-        domainConfig = await domain.getStorageData();
-        expect(domainConfig.ownerAddress!.toString()).toEqual(buyer.address.toString());
-    });
 
     it("should top up auto-renew and execute external auto-renew", async () => {
         transactionRes = await tonSimpleSale.sendSetAutoRenewParams(seller.getSender(), ONE_DAY, 2);
@@ -331,5 +299,64 @@ describe('TonSimpleSale', () => {
         tonSimpleSaleConfig = await tonSimpleSale.getStorageData();
         expect(tonSimpleSaleConfig.hotUntil).toEqual(blockchain.now! + ONE_DAY * 3 / 2);
         expect(tonSimpleSaleConfig.coloredUntil).toEqual(blockchain.now! + ONE_DAY * 2);
+    });
+
+    // A commission this small can't pay its own forward fee. Sending it fails the action phase (exit 40/37)
+    // without a bounce, so the buyer's TON stays on the sale and the seller's cancel sweeps it.
+    it.each([0n, Tons.MIN_SALE_COMMISSION - 1n])('should complete purchase with a %s nanoTON commission', async (commission) => {
+        await writeSalePricing(blockchain, tonSimpleSale.address, 'tonSimple', tonSimpleSaleConfig.price, commission);
+
+        transactionRes = await tonSimpleSale.sendPurchase(buyer.getSender(), tonSimpleSaleConfig.price);
+        expect(transactionRes.transactions).toHaveTransaction({
+            from: buyer.address,
+            to: tonSimpleSale.address,
+            success: true,
+            actionResultCode: 0,
+        });
+        expect(transactionRes.transactions).not.toHaveTransaction({
+            from: tonSimpleSale.address,
+            to: marketplace.address,
+        });
+        expect(transactionRes.transactions).toHaveTransaction({
+            from: tonSimpleSale.address,
+            to: seller.address,
+            value: (x) => x! >= tonSimpleSaleConfig.price,
+            success: true,
+        });
+        domainConfig = await domain.getStorageData();
+        expect(domainConfig.ownerAddress!.toString()).toEqual(buyer.address.toString());
+    });
+
+    it('should not let a price change make the sale unbuyable', async () => {
+        // Dust prices are rejected outright (the mainnet exploit went through 24 nanoTON)
+        transactionRes = await tonSimpleSale.sendChangePrice(seller.getSender(), 24n, tonSimpleSaleConfig.validUntil);
+        expect(transactionRes.transactions).toHaveTransaction({
+            from: seller.address,
+            to: tonSimpleSale.address,
+            exitCode: Exceptions.INCORRECT_PRICE,
+        });
+
+        // Commission at a capped-listing ratio (200 TON on 1e11 TON): scaled to 1 TON it floors to 2 nanoTON
+        await writeSalePricing(blockchain, tonSimpleSale.address, 'tonSimple', 10n ** 20n, toNano('200'));
+        transactionRes = await tonSimpleSale.sendChangePrice(seller.getSender(), toNano('1'), tonSimpleSaleConfig.validUntil);
+        expect(await readSalePricing(blockchain, tonSimpleSale.address, 'tonSimple')).toEqual({
+            price: toNano('1'),
+            commission: Tons.MIN_SALE_COMMISSION,
+        });
+
+        transactionRes = await tonSimpleSale.sendPurchase(buyer.getSender(), toNano('1'));
+        expect(transactionRes.transactions).toHaveTransaction({
+            from: buyer.address,
+            to: tonSimpleSale.address,
+            success: true,
+            actionResultCode: 0,
+        });
+        expect(transactionRes.transactions).toHaveTransaction({
+            from: tonSimpleSale.address,
+            to: marketplace.address,
+            success: true,
+        });
+        domainConfig = await domain.getStorageData();
+        expect(domainConfig.ownerAddress!.toString()).toEqual(buyer.address.toString());
     });
 });

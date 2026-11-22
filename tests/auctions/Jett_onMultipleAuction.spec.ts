@@ -1,14 +1,14 @@
 import { Blockchain, printTransactionFees, SandboxContract, SendMessageResult, TreasuryContract } from '@ton/sandbox';
 import { Address, beginCell, Cell, Dictionary, toNano } from '@ton/core';
-import { JettonMultipleAuction, JettonMultipleAuctionConfig } from '../wrappers/JettonMultipleAuction';
+import { JettonMultipleAuction, JettonMultipleAuctionConfig, jettonMultipleAuctionConfigToCell } from '../../wrappers/JettonMultipleAuction';
 import '@ton/test-utils';
 import { compile } from '@ton/blueprint';
-import { DnsCollection, DnsCollectionConfig } from '../wrappers/DnsCollection';
-import { Domain, DomainConfig } from '../wrappers/Domain';
-import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes, Tons } from '../wrappers/helpers/constants';
-import { abs, min, max } from './helpers/common';
-import { JettonMinter } from '../wrappers/JettonMinter';
-import { JettonWallet } from '../wrappers/JettonWallet';
+import { DnsCollection, DnsCollectionConfig } from '../../wrappers/DnsCollection';
+import { Domain, DomainConfig } from '../../wrappers/Domain';
+import { Exceptions, MIN_PRICE_START_TIME, ONE_DAY, ONE_YEAR, OpCodes, Tons } from '../../wrappers/helpers/constants';
+import { abs, min, max } from '../helpers/common';
+import { JettonMinter } from '../../wrappers/JettonMinter';
+import { JettonWallet } from '../../wrappers/JettonWallet';
 
 describe('JettonMultipleAuction', () => {
     let jettonMinterCode: Cell;
@@ -70,7 +70,19 @@ describe('JettonMultipleAuction', () => {
 
     async function sendDomainsToAuction() {
         for (let domain of domains) {
-            transactionRes = await domain.sendTransfer(seller.getSender(), jettonMultipleAuction.address, seller.address, null, toNano('0.04'));
+            transactionRes = await domain.sendTransfer(seller.getSender(), jettonMultipleAuction.address, seller.address, null, toNano('0.1'));
+            if (domain === domains[0]) {
+                const receipt = transactionRes.transactions.find(tx =>
+                    tx.inMessage?.info.type === 'internal'
+                    && tx.inMessage.info.src.equals(domain.address)
+                    && tx.inMessage.info.dest.equals(jettonMultipleAuction.address))!.inMessage!;
+                const duplicate = await blockchain.sendMessage(receipt);
+                expect(duplicate.transactions).not.toHaveTransaction({
+                    from: jettonMultipleAuction.address, to: domain.address, op: OpCodes.TRANSFER_NFT,
+                });
+                expect((await jettonMultipleAuction.getStorageData()).domainsReceived).toBe(1);
+                expect((await domain.getStorageData()).ownerAddress).toEqualAddress(jettonMultipleAuction.address);
+            }
             domainConfigs.push(await domain.getStorageData());
         }
     }
@@ -319,6 +331,62 @@ describe('JettonMultipleAuction', () => {
         }
     });
 
+    it.each(['minBidValue', 'maxBidValue'] as const)(
+        'should refund a %s jetton bid after deferred auction cancellation', async (bidField) => {
+            jettonMultipleAuctionConfig.isDeferred = true;
+            await deployAuction();
+            await sendDomainsToAuction();
+            expect(blockchain.now!).toBeLessThan(jettonMultipleAuctionConfig.startTime);
+
+            await jettonMultipleAuction.sendStopAuction(seller.getSender());
+            const cancelledState = await jettonMultipleAuction.getStorageData();
+            expect(cancelledState.state).toBe(JettonMultipleAuction.STATE_CANCELLED);
+            expect(cancelledState.isDeferred).toBe(true);
+            expect(cancelledState.domainsReceived).toBe(domains.length);
+            const buyerBefore = await usdtBuyerWallet.getJettonBalance();
+            const sellerBefore = await usdtSellerWallet.getJettonBalance();
+            const marketplaceBefore = await usdtAdminWallet.getJettonBalance();
+            const bidValue = cancelledState[bidField];
+
+            const rejected = await usdtBuyerWallet.sendTransfer(
+                buyer.getSender(), bidValue, jettonMultipleAuction.address, buyer.address,
+                JettonMultipleAuction.getTonsToEndAuction(domains.length) + toNano('0.05'),
+            );
+            expect(rejected.transactions).toHaveTransaction({
+                from: usdtAuctionWallet.address,
+                to: jettonMultipleAuction.address,
+                exitCode: Exceptions.DEAL_NOT_ACTIVE,
+            });
+            expect(rejected.transactions).toHaveTransaction({
+                from: usdtBuyerWallet.address,
+                to: buyer.address,
+                body: JettonWallet.transferNotificationMessage(
+                    bidValue, jettonMultipleAuction.address,
+                    beginCell().storeUint(0, 32)
+                        .storeStringTail(`Error. Code ${Exceptions.DEAL_NOT_ACTIVE}`).endCell(),
+                ),
+            });
+            // The 1-nanoton notification can skip compute; the token refund must execute.
+            expect(rejected.transactions).toHaveTransaction({
+                from: usdtAuctionWallet.address,
+                to: usdtBuyerWallet.address,
+                success: true,
+            });
+            expect(await usdtBuyerWallet.getJettonBalance()).toBe(buyerBefore);
+            expect(await usdtSellerWallet.getJettonBalance()).toBe(sellerBefore);
+            expect(await usdtAdminWallet.getJettonBalance()).toBe(marketplaceBefore);
+            expect(await usdtAuctionWallet.getJettonBalance()).toBe(0n);
+            expect(jettonMultipleAuctionConfigToCell(await jettonMultipleAuction.getStorageData()))
+                .toEqualCell(jettonMultipleAuctionConfigToCell(cancelledState));
+            for (const domain of domains) {
+                expect(rejected.transactions).not.toHaveTransaction({
+                    from: jettonMultipleAuction.address, to: domain.address,
+                });
+                expect((await domain.getStorageData()).ownerAddress!.equals(seller.address)).toBe(true);
+            }
+        },
+    );
+
     it('should verify balances after successful auction completion', async () => {
         await sendDomainsToAuction();
         blockchain.now = jettonMultipleAuctionConfig.startTime;
@@ -556,10 +624,13 @@ describe('JettonMultipleAuction', () => {
         });
         
         blockchain.now = jettonMultipleAuctionConfig.endTime;
-        // Try to cancel auction from non-seller address
-        transactionRes = await jettonMultipleAuction.sendStopAuction(admin.getSender());
+        // Try to finalize the ended auction from an unauthorized party. After end, the internal
+        // finalize path is restricted to seller / last bidder / admin, so a random outsider is rejected.
+        // (admin itself is privileged here and would succeed — see contract.tolk finalize branch.)
+        const outsider = await blockchain.treasury('outsider');
+        transactionRes = await jettonMultipleAuction.sendStopAuction(outsider.getSender());
         expect(transactionRes.transactions).toHaveTransaction({
-            from: admin.address,
+            from: outsider.address,
             to: jettonMultipleAuction.address,
             exitCode: Exceptions.INCORRECT_SENDER
         });

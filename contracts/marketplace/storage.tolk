@@ -2,9 +2,11 @@ import "types"
 
 struct MarketplaceStorageDs2 {
     web3WalletAddress: address;
+    usdtWalletAddress: address;
     promotionPrices: dict;    // promotionPeriod -> makeHotPrice(uint64), makeColoredPrice(uint64)
     userSubscriptions: dict;  // userAddress -> subscriptionLevel(uint8), subscriptionEnd(uint32)
     subscriptionsInfo: dict;  // subscriptionLevel -> dict{subscriptionPeriod(uint32) -> subscriptionPrice(uint64)}
+    dnsRecordsDict: dict;     // dnsRecord(uint256 category key) -> dns record value (stored as a ref)
 }
 
 struct MarketplaceStorage {
